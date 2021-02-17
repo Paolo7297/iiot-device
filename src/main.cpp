@@ -2,7 +2,6 @@
 #include <SPI.h>
 
 #include <ESP8266WiFi.h>
-//#include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
 
 #include <FastLED.h>
@@ -13,6 +12,12 @@
 
 #include <MFRC522.h>
 
+#include <ArduinoJson.h>
+
+#include <Servo.h>
+
+#include <LittleFS.h>
+
 //RFID RC522 PINS
 #define RST_PIN D9
 #define SDA_PIN D10
@@ -21,29 +26,40 @@
 #define SCK_PIN D13
 
 //Addressable RGB PINS
-#define LED_PIN     D3
+#define LED_PIN D4
 
 //HC-SR04 PINS
-#define ECHO_PIN D4
-#define TRIG_PIN D5
+#define ECHO_PIN D2
+#define TRIG_PIN D3
+
+//Servo PIN
+#define SERVO_PIN D8
 
 //Addressable RGB DATAS
 #define COLOR_ORDER GRB
-#define CHIPSET     WS2812
+#define CHIPSET WS2812
 
 //RFID RC522 DATAS
 #define POS 8
 #define SIZE 16
-#define ROWTOREAD 2
+#define ROWTOREAD 1
+
+//Servo DATAS
+#define SERVO_OPEN 0
+#define SERVO_CLOSE 90
 
 //HC-SR04 vars
 Ultrasonic hcsr04(TRIG_PIN,ECHO_PIN);
-
 int counter = 0;
 int sum = 0;
+int before = 0;
+int after = 0;
 
-//Addressable RGB variable
+//Addressable RGB vars
 CRGB leds[1];
+
+//Servo vars
+Servo door;
 
 //RFID RC522 vars
 MFRC522 mfrc522(SDA_PIN, RST_PIN);
@@ -58,30 +74,30 @@ const byte sector		 = POS / 4;
 const byte blockAddr	  = POS;
 const byte trailerBlock   = (POS / 4) * 4 + 3;
 
-const byte dataBlock1[] = {
-	0xFF, 0xFF, 0xFF, 0xFF,
-	0xFF, 0xFF, 0xFF, 0xFF,
-	0x00, 0x01, 0x02, 0x03,
-	0x04, 0x05, 0x06, 0x07
-};
-
-const byte dataBlock2[] = {
-	0x08, 0x09, 0x0A, 0x0B,
-	0x0C, 0x0D, 0x0E, 0x0F,
-	0xFF, 0xFF, 0xFF, 0xFF,
-	0xFF, 0xFF, 0xFF, 0xFF 
-};
+//Json
+StaticJsonDocument<100> json;
 
 //Wifi connection
-const char* ssid = "Casellati Wifi";
-const char* password = "cuq98lcvomu4d";
-
-const char* server = "192.168.1.156";
-const int rest_port = 8080;
-const char* rest_path = "/users/";
+// const char* ssid = "Casellati Wifi";
+// const char* password = "cuq98lcvomu4d";
 WiFiClient client;
 
+//Rest WS vars
+//const char* server = "aac74be238fb64ab53f91b6eb5ebc154.balena-devices.com";
+const int rest_port = 80;
+const char* user_rest_path = "/users/";
+const char* bins_rest_path = "/waste_bins/";
+const bool ssl = false;
 
+//EEPROM
+
+String ssid;
+String password;
+String server;
+String uuid;
+
+
+//Functions
 void print_byte_array(byte *buffer, byte bufferSize);
 int read_with_no_error(byte start, byte end, byte **buffer, byte size_in_index);
 
@@ -89,25 +105,59 @@ void setGreen();
 void setRed();
 void setYellow();
 void setOff();
-void setAll();
+void setWhite();
 
 void error();
 
+void openGate();
+void closeGate();
+char * hex2str(byte dataBlock[]);
 void setup() {
 	Serial.begin(9600);
+	Serial.println();
 	Serial.println("Progetto Industrial IoT");
 	Serial.println("di Paolo Casellati e Fabio Bedeschi");
 	Serial.println("Prototipo di bidone della spazzatura");
 	Serial.println("---------------------------------------------");
-	Serial.println("Imposto il necessario.");
+	
+	if (! LittleFS.begin()) {
+		Serial.println("Formatting...");
+		LittleFS.format();
+	}
+
+	// File f = LittleFS.open("/data.txt", "w+");
+	// f.println("aac74be238fb64ab53f91b6eb5ebc154.balena-devices.com");
+	// f.println("08090A0B0C0D0E0FFFFFFFFFFFFFFFFF");
+	// f.println("Casellati Wifi");
+	// f.println("cuq98lcvomu4d");
+	// f.close();
+
+	File f = LittleFS.open("/data.txt", "r");
+	Serial.println();
+	server = f.readStringUntil('\n');
+	uuid = f.readStringUntil('\n');
+	ssid = f.readStringUntil('\n');
+	password = f.readStringUntil('\n');
+	
+	server.trim();
+	uuid.trim();
+	ssid.trim();
+	password.trim();
+		
+	LittleFS.end();
+
 	SPI.begin();		
 	mfrc522.PCD_Init(); 
 	delay(4);
 	mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+	
 	FastLED.addLeds<NEOPIXEL, LED_PIN>(leds,1);
 	FastLED.setBrightness(10);
+	
+	door.attach(SERVO_PIN);
+
 	Serial.print("Connessione alla WiFi");
-	WiFi.begin(ssid,password);
+	WiFi.begin(ssid.c_str(),password.c_str());
 	while (WiFi.status() != WL_CONNECTED) {
 		Serial.print(".");
 		delay(250);
@@ -116,9 +166,12 @@ void setup() {
 	Serial.print("Connesso a ");
 	Serial.print(ssid);
 	Serial.println(" correttamente.");
-	
-	setGreen();
 
+	//TODO: Scaricare l'aggiornamento degli indirizzi
+
+	setGreen();
+	
+	//Password 
 	for (byte i = 0; i < 6; i++) {
 		key.keyByte[i] = 0xFF;
 	}
@@ -136,22 +189,37 @@ char * hex2str(byte dataBlock[]) {
 
 void on_detect() {
 	Serial.println("Riconosciuto TAG...");
-	setOff();
+	setWhite();
 
 	byte **buffer = (byte **) malloc(ROWTOREAD * sizeof(byte *));
 	Serial.println(F("Auth con chiave A..."));
 	if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &key, &(mfrc522.uid)) == MFRC522::STATUS_OK) {
 		if (read_with_no_error(blockAddr, trailerBlock, buffer, ROWTOREAD) == 0) {
-			//TODO: Network call for a check, temporarly use local data to check, in future only 200, OK, https so problems
 			if (WiFi.isConnected()) {
 				HTTPClient http;
 
-				http.begin(client,server,rest_port, (rest_path) + String(hex2str(buffer[0])),false);
+				http.begin(client,server,rest_port, (user_rest_path) + String(hex2str(buffer[0])),ssl);
 				int httpCode = http.GET();
+				
 				if (httpCode > 0) {
+					http.end();
 					Serial.println(httpCode);
 					if (httpCode == HTTP_CODE_OK) {
-						//TODO: Move the servo to open the trash
+						counter = 0;
+						sum = 0;
+						while (counter < 5) {
+							int tmp =hcsr04.read();
+							if (tmp >1 && tmp < 200 ) {
+								sum += tmp;
+								counter++;
+							}
+							Serial.println(tmp);
+							delay(200);
+						}
+						before = sum/counter;
+
+
+						openGate();
 						setYellow();
 
 						unsigned long currentMillis = millis();
@@ -159,12 +227,56 @@ void on_detect() {
 							delay(10);
 						}
 
-						// TODO: Move the servo to close the trash
+						closeGate();
+
+						counter = 0;
+						sum = 0;
+						while (counter < 5) {
+							int tmp =hcsr04.read();
+							if (tmp >1 && tmp < 200 ) {
+								sum += tmp;
+								counter++;
+							}
+							Serial.println(tmp);
+							delay(200);
+						}
+						after = sum/counter;
+						json["delta"] = after - before;
+						String out;
+						serializeJson(json, out);
+						Serial.println(out);
+						http.begin(client,server,rest_port, (user_rest_path) + String(hex2str(buffer[0])),ssl);
+						http.addHeader("Content-Type", "application/json");
+						httpCode = http.PATCH(out);
+						if (httpCode > 0) {
+							Serial.println(httpCode);
+						} else {
+							Serial.println(http.errorToString(httpCode).c_str());
+						}
+						http.end();
+						json.clear();
+						out = "";
+
+						json["fill_level"] = after;
+						serializeJson(json, out);
+						Serial.println(out);
+						http.begin(client,server,rest_port, (bins_rest_path) + String(hex2str(buffer[0])),ssl);
+						http.addHeader("Content-Type", "application/json");
+						httpCode = http.PATCH(out);
+						if (httpCode > 0) {
+							Serial.println(httpCode);
+						} else {
+							Serial.println(http.errorToString(httpCode).c_str());
+						}
+						http.end();
+						json.clear();
+
 					} else {
 						error();
 					}
 				} else {
 					Serial.println(http.errorToString(httpCode).c_str());
+					http.end();
 					error();
 				}	
 			} else {
@@ -245,7 +357,7 @@ void setOff() {
 	FastLED.show();
 }
 
-void setAll() {
+void setWhite() {
 	// setColor(HIGH,HIGH,HIGH);
 	leds[0] = CRGB::White;
 	FastLED.show();
@@ -255,18 +367,18 @@ void error() {
 	setRed();
 }
 
-void loop() {
-	int tmp =hcsr04.read();
-	if (tmp >1 && tmp < 200 ) {
-		sum += tmp;
-		counter++;
 
-		if (counter %  10 == 0 && counter > 0) {
-			Serial.println(sum/counter);
-		}
-	}
+void openGate(){
+	door.write(SERVO_OPEN);
 	delay(100);
+}
 
+void closeGate(){
+	door.write(SERVO_CLOSE);
+	delay(100);
+}
+
+void loop() {
 	rfid_tag_present_prev = rfid_tag_present;
 
 	_rfid_error_counter += 1;
@@ -274,20 +386,18 @@ void loop() {
 	_tag_found = false;
 	}
 
-	// Detect Tag without looking for collisions
 	byte bufferATQA[2];
 	byte bufferSize = sizeof(bufferATQA);
 
-	// Reset baud rates
 	mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
 	mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
-	// Reset ModWidthReg
+
 	mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
 
 	MFRC522::StatusCode result = mfrc522.PICC_RequestA(bufferATQA, &bufferSize);
 
 	if(result == mfrc522.STATUS_OK){
-		if ( ! mfrc522.PICC_ReadCardSerial()) { //Since a PICC placed get Serial and continue   
+		if ( ! mfrc522.PICC_ReadCardSerial()) {
 			return;
 		}
 		_rfid_error_counter = 0;
@@ -296,11 +406,12 @@ void loop() {
 
 	rfid_tag_present = _tag_found;
 
-	// rising edge
+	// Viene letto
 	if (rfid_tag_present && !rfid_tag_present_prev){
 		on_detect();
 	}
 
+	//finché resta appoggiato non faccio nulla
 	if (!rfid_tag_present && rfid_tag_present_prev){
 		on_detach();
 	}
