@@ -36,8 +36,8 @@
 #define ROWTOREAD 1
 
 //Servo DATAS
-#define SERVO_OPEN 90
-#define SERVO_CLOSE 7
+#define SERVO_OPEN 88
+#define SERVO_CLOSE 9
 
 //HC-SR04 DATAS
 #define NUM_SCAN 1
@@ -75,18 +75,17 @@ StaticJsonDocument<100> json;
 WiFiClient client;
 
 //Rest WS vars
-
 const int rest_port = 80;
 const char* user_rest_path = "/users/";
 const char* bins_rest_path = "/waste_bins/";
 const bool ssl = false;
 
 //EEPROM
-
 String ssid; // const char* ssid = "Casellati Wifi";
 String password; // const char* password = "cuq98lcvomu4d";
 String server; //const char* server = "aac74be238fb64ab53f91b6eb5ebc154.balena-devices.com";
 String uuid; // "82a7c1de55d74a97a465c4f3fa283ed1"
+int max_value;
 
 //Functions
 void print_byte_array(byte *buffer, byte bufferSize);
@@ -108,7 +107,7 @@ int getScan();
 void setup() {
 	Serial.begin(9600);
 	Serial.println();
-	delay(1000);
+	delay(2000);
 	Serial.println("Progetto Industrial IoT");
 	Serial.println("di Paolo Casellati e Fabio Bedeschi");
 	Serial.println("Prototipo di bidone della spazzatura");
@@ -131,11 +130,25 @@ void setup() {
 	File f = LittleFS.open("/data.txt", "r");
 	server = f.readStringUntil('\n');
 	uuid = f.readStringUntil('\n');
+	f.close();
 
 	f = LittleFS.open("/wifi.txt", "r");
 	ssid = f.readStringUntil('\n');
 	password = f.readStringUntil('\n');
+	f.close();
 	
+	f = LittleFS.open("/max.txt", "r");
+	if (!f) {
+		int val = getScan();
+		f = LittleFS.open("/max.txt", "w+");
+		f.println(val);
+		f.close();
+	}
+
+	f = LittleFS.open("/max.txt", "r");
+	max_value = String(f.readStringUntil('\n')).toInt();
+	f.close();
+
 	server.trim();
 	uuid.trim();
 	ssid.trim();
@@ -165,8 +178,6 @@ void setup() {
 	Serial.print("Connesso a ");
 	Serial.print(ssid);
 	Serial.println(" correttamente.");
-
-	//TODO: Scaricare l'aggiornamento degli indirizzi
 
 	setGreen();
 	
@@ -210,7 +221,7 @@ void on_detect() {
 						setYellow();
 
 						unsigned long currentMillis = millis();
-						while (millis() < currentMillis + 10000){
+						while (millis() < currentMillis + 20000){
 							delay(10);
 						}
 
@@ -219,10 +230,9 @@ void on_detect() {
 						after = getScan();
 						Serial.println(after);
 						Serial.println(before);
-						json["delta"] = after - before;
 						String out;
+						// json["delta"] = after - before;
 						serializeJson(json, out);
-						Serial.println(out);
 						http.begin(client,server,rest_port, (user_rest_path) + String(hex2str(buffer[0])),ssl);
 						http.addHeader("Content-Type", "application/json");
 						httpCode = http.PATCH(out);
@@ -234,8 +244,7 @@ void on_detect() {
 						http.end();
 						json.clear();
 						out = "";
-
-						json["fill_level"] = after;
+						json["fill_level"] = String((int) ((float) (max_value - after) / max_value * 100));
 						serializeJson(json, out);
 						Serial.println(out);
 						http.begin(client,server,rest_port, (bins_rest_path) + String(uuid),ssl);
@@ -313,31 +322,26 @@ int read_with_no_error(byte start, byte end, byte **buffer, byte size_in_index) 
 }
 
 void setGreen() {
-	// setColor(LOW,HIGH,LOW);
 	leds[0] = CRGB::Green;
 	FastLED.show();
 }
 
 void setRed() {
-	// setColor(HIGH,LOW,LOW);
 	leds[0] = CRGB::Red;
 	FastLED.show();
 }
 
 void setYellow() {
-	// setColor(LOW,LOW,HIGH);
 	leds[0] = CRGB::Yellow;
 	FastLED.show();
 }
 
 void setOff() {
-	// setColor(LOW,LOW,LOW);
 	leds[0] = CRGB::Black;
 	FastLED.show();
 }
 
 void setWhite() {
-	// setColor(HIGH,HIGH,HIGH);
 	leds[0] = CRGB::White;
 	FastLED.show();
 }
